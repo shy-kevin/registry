@@ -7,8 +7,11 @@ import javax.swing.tree.DefaultTreeModel;
 import javax.swing.tree.TreePath;
 import java.awt.*;
 import java.awt.event.*;
-import java.io.IOException;
+import java.io.*;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.Stack;
 
@@ -120,12 +123,30 @@ public class RegistryEditor extends JFrame {
 
         // 文件菜单
         JMenu fileMenu = new JMenu("文件");
+
+        // 导出子菜单（原逻辑保留）
+        JMenu exportMenu = new JMenu("导出");
+        JMenuItem exportAllItem = new JMenuItem("导出全部注册表");
+        exportAllItem.addActionListener(e -> exportRegistry(true));
+        JMenuItem exportSelectedItem = new JMenuItem("导出所选项");
+        exportSelectedItem.addActionListener(e -> exportRegistry(false));
+        exportMenu.add(exportAllItem);
+        exportMenu.add(exportSelectedItem);
+
+        // 新增“导入注册表”选项
+        JMenuItem importItem = new JMenuItem("导入注册表");
+        importItem.addActionListener(e -> importRegistry());
+
+        // 保存退出
         JMenuItem saveItem = new JMenuItem("保存");
         saveItem.addActionListener(e -> saveRegistry());
 
         JMenuItem exitItem = new JMenuItem("退出");
         exitItem.addActionListener(e -> System.exit(0));
 
+        fileMenu.add(exportMenu);
+        fileMenu.add(importItem); // 插入导入选项
+        fileMenu.addSeparator();
         fileMenu.add(saveItem);
         fileMenu.addSeparator();
         fileMenu.add(exitItem);
@@ -151,6 +172,379 @@ public class RegistryEditor extends JFrame {
 
         setJMenuBar(menuBar);
     }
+
+    //----------------------------------备份与导出部分的代码----------------------------------------------
+
+    /**
+     * 导出注册表（支持全部导出和选中项导出）
+     * @param exportAll 是否导出全部注册表
+     */
+    private void exportRegistry(boolean exportAll) {
+        // 确定要导出的注册表项
+        RegistryKey exportKey = null;
+        String defaultFileName = "registry_backup.reg";
+
+        if (!exportAll) {
+            TreePath selectionPath = registryTree.getSelectionPath();
+            if (selectionPath == null) {
+                JOptionPane.showMessageDialog(this, "请先选择要导出的注册表项");
+                return;
+            }
+
+            DefaultMutableTreeNode selectedNode =
+                    (DefaultMutableTreeNode) selectionPath.getLastPathComponent();
+
+            if (!(selectedNode.getUserObject() instanceof RegistryKey)) {
+                JOptionPane.showMessageDialog(this, "请选择有效的注册表项");
+                return;
+            }
+
+            exportKey = (RegistryKey) selectedNode.getUserObject();
+            defaultFileName = exportKey.getName() + "_backup.reg";
+        }
+
+        // 显示文件选择器
+        JFileChooser fileChooser = new JFileChooser();
+        fileChooser.setDialogTitle(exportAll ? "导出全部注册表" : "导出所选项");
+        fileChooser.setSelectedFile(new File(defaultFileName));
+
+        // 添加.reg文件过滤器
+        fileChooser.setFileFilter(new javax.swing.filechooser.FileFilter() {
+            @Override
+            public boolean accept(File f) {
+                return f.isDirectory() || f.getName().toLowerCase().endsWith(".reg");
+            }
+
+            @Override
+            public String getDescription() {
+                return "注册表文件 (*.reg)";
+            }
+        });
+
+        int userSelection = fileChooser.showSaveDialog(this);
+        if (userSelection == JFileChooser.APPROVE_OPTION) {
+            File fileToSave = fileChooser.getSelectedFile();
+
+            // 确保文件以.reg结尾
+            if (!fileToSave.getName().toLowerCase().endsWith(".reg")) {
+                fileToSave = new File(fileToSave.getAbsolutePath() + ".reg");
+            }
+
+            // 检查文件是否已存在
+            if (fileToSave.exists()) {
+                int confirm = JOptionPane.showConfirmDialog(this,
+                        "文件已存在，是否覆盖？", "确认覆盖",
+                        JOptionPane.YES_NO_OPTION);
+                if (confirm != JOptionPane.YES_OPTION) {
+                    return;
+                }
+            }
+
+            try {
+                // 导出注册表内容到文件
+                exportRegistryToFile(fileToSave, exportAll, exportKey);
+
+                JOptionPane.showMessageDialog(this,
+                        "注册表已成功导出到:\n" + fileToSave.getAbsolutePath(),
+                        "导出成功", JOptionPane.INFORMATION_MESSAGE);
+            } catch (IOException ex) {
+                JOptionPane.showMessageDialog(this,
+                        "导出注册表失败: " + ex.getMessage(),
+                        "错误", JOptionPane.ERROR_MESSAGE);
+                ex.printStackTrace();
+            }
+        }
+    }
+
+    /**
+     * 将注册表内容导出到文件（类似Windows的.reg格式）
+     */
+    private void exportRegistryToFile(File file, boolean exportAll, RegistryKey exportKey)
+            throws IOException {
+        try (BufferedWriter writer = new BufferedWriter(
+                new OutputStreamWriter(new FileOutputStream(file), StandardCharsets.UTF_16LE))) {
+
+            // 写入REG文件头部
+            writer.write("DataOS Registry Editor Version 1.00");
+            writer.newLine();
+            writer.newLine();
+
+            if (exportAll) {
+                // 导出全部注册表
+                for (RegistryKey topKey : registry.getTopLevelKeys().values()) {
+                    exportRegistryKey(writer, topKey, topKey.getName());
+                }
+            } else {
+                // 导出选中的注册表项
+                String keyPath = getKeyPath(exportKey);
+                exportRegistryKey(writer, exportKey, keyPath);
+            }
+        }
+    }
+
+    /**
+     * 递归导出注册表项及其子项
+     */
+    private void exportRegistryKey(BufferedWriter writer, RegistryKey key, String fullPath)
+            throws IOException {
+        // 写入项路径
+        writer.write("[\"" + fullPath + "\"]");
+        writer.newLine();
+
+        // 写入键值对
+        for (RegistryValue value : key.getValues().values()) {
+            String valueStr;
+            switch (value.getType()) {
+                case "String":
+                case "Multi-String":
+                    valueStr = "\"" + escapeValue(value.getValue()) + "\"";
+                    break;
+                case "DWord":
+                    valueStr = "dword:" + value.getValue().toLowerCase();
+                    break;
+                case "QWord":
+                    valueStr = "hex(7):" + value.getValue().toLowerCase();
+                    break;
+                case "Binary":
+                    valueStr = "hex:" + value.getValue();
+                    break;
+                default:
+                    valueStr = "\"" + escapeValue(value.getValue()) + "\"";
+            }
+
+            // 处理默认值
+            if (value.getName().isEmpty() || value.getName().equals("@")) {
+                writer.write("@=" + valueStr);
+            } else {
+                writer.write("\"" + value.getName() + "\"=" + valueStr);
+            }
+            writer.newLine();
+        }
+
+        writer.newLine();
+
+        // 递归导出子项
+        String childPath;
+        for (RegistryKey childKey : key.getSubKeys().values()) {
+            childPath = fullPath + "\\" + childKey.getName();
+            exportRegistryKey(writer, childKey, childPath);
+        }
+    }
+
+    /**
+     * 转义值中的特殊字符
+     */
+    private String escapeValue(String value) {
+        if (value == null) return "";
+        return value.replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r");
+    }
+
+    /**
+     * 获取注册表项的完整路径
+     */
+    private String getKeyPath(RegistryKey key) {
+        // 查找顶级节点
+        for (Map.Entry<String, RegistryKey> entry : registry.getTopLevelKeys().entrySet()) {
+            String path = findKeyPath(entry.getValue(), key, entry.getKey());
+            if (path != null) {
+                return path;
+            }
+        }
+        return key.getName();
+    }
+
+    /**
+     * 递归查找注册表项的完整路径
+     */
+    private String findKeyPath(RegistryKey currentKey, RegistryKey targetKey, String currentPath) {
+        if (currentKey == targetKey) {
+            return currentPath;
+        }
+
+        for (RegistryKey childKey : currentKey.getSubKeys().values()) {
+            String path = findKeyPath(childKey, targetKey, currentPath + "\\" + childKey.getName());
+            if (path != null) {
+                return path;
+            }
+        }
+
+        return null;
+    }
+    //----------------------------------备份与导出部分的代码----------------------------------------------
+
+    //----------------------------------导入注册表代码----------------------------------------------
+
+    /**
+     * 导入注册表（从 .reg 文件加载并合并到当前注册表）
+     */
+    private void importRegistry() {
+        JFileChooser fileChooser = new JFileChooser();
+        fileChooser.setDialogTitle("导入注册表文件");
+        fileChooser.setFileFilter(new javax.swing.filechooser.FileFilter() {
+            @Override
+            public boolean accept(File f) {
+                return f.isDirectory() || f.getName().toLowerCase().endsWith(".reg");
+            }
+
+            @Override
+            public String getDescription() {
+                return "注册表文件 (*.reg)";
+            }
+        });
+
+        int userSelection = fileChooser.showOpenDialog(this);
+        if (userSelection == JFileChooser.APPROVE_OPTION) {
+            File importFile = fileChooser.getSelectedFile();
+            try {
+                importRegistryFromFile(importFile);
+                JOptionPane.showMessageDialog(this,
+                        "注册表导入成功！\n文件：" + importFile.getAbsolutePath(),
+                        "导入成功", JOptionPane.INFORMATION_MESSAGE);
+                // 导入后刷新树结构
+                loadRegistryData();
+            } catch (Exception ex) {
+                JOptionPane.showMessageDialog(this,
+                        "导入失败：" + ex.getMessage(),
+                        "错误", JOptionPane.ERROR_MESSAGE);
+                ex.printStackTrace();
+            }
+        }
+    }
+
+    /**
+     * 从 .reg 文件解析并导入注册表内容
+     * @throws IOException  文件读取错误
+     * @throws RegistryImportException  格式不兼容或解析错误
+     */
+    private void importRegistryFromFile(File file)
+            throws IOException, RegistryImportException {
+        List<String> lines = Files.readAllLines(file.toPath(), StandardCharsets.UTF_16LE);
+        if (lines.isEmpty()) {
+            throw new RegistryImportException("空的 .reg 文件");
+        }
+
+        // 检查文件头部（兼容格式）
+        if (!lines.get(0).trim().equals("DataOS Registry Editor Version 1.00")) {
+            throw new RegistryImportException("不支持的 .reg 文件格式");
+        }
+
+        RegistryKey currentKey = null;
+        for (int i = 1; i < lines.size(); i++) {
+            String line = lines.get(i).trim();
+            if (line.isEmpty()) continue;
+
+            // 解析注册表项路径（如 ["HKEY_CURRENT_USER\\Software\\MyApp"]）
+            if (line.startsWith("[") && line.endsWith("]")) {
+                String path = line.substring(1, line.length() - 1)
+                        .replace("\"", "") // 处理 Windows 导出的带引号路径
+                        .replace("\\\\", "\\"); // 处理转义反斜杠
+                currentKey = resolveRegistryKey(path);
+                if (currentKey == null) {
+                    throw new RegistryImportException("无效的注册表路径：" + path);
+                }
+            }
+            // 解析键值对（如 "Name"="Value" 或 @="DefaultValue"）
+            else if (currentKey != null) {
+                String[] parts = line.split("=", 2);
+                if (parts.length != 2) {
+                    throw new RegistryImportException("无效的键值对格式：" + line);
+                }
+                String namePart = parts[0].trim().replace("\"", "");
+                String valuePart = parts[1].trim();
+
+                // 处理默认值（@ 符号）
+                String valueName = namePart.equals("@") ? "" : namePart;
+                // 解析值内容（自动识别类型）
+                RegistryValue value = parseRegistryValue(valuePart);
+                if (value != null) {
+                    // 若存在同名键值，覆盖；否则新增
+                    currentKey.getValues().put(valueName, value);
+                }
+            }
+        }
+        // 导入后保存当前注册表状态
+        saveRegistry();
+    }
+
+    /**
+     * 根据路径查找或创建注册表项（自动处理顶级节点匹配）
+     * @return  找到或创建的 RegistryKey，若路径无效返回 null
+     */
+    private RegistryKey resolveRegistryKey(String fullPath) {
+        // 分割路径（如 "HKEY_CURRENT_USER\\Software\\MyApp" -> 拆分多级）
+        String[] pathParts = fullPath.split("\\\\");
+        if (pathParts.length == 0) return null;
+
+        // 处理顶级节点（如 "HKEY_CURRENT_USER" 匹配 registry.topLevelKeys）
+        String topLevelName = pathParts[0];
+        RegistryKey topKey = registry.getTopLevelKeys().get(topLevelName);
+        if (topKey == null) {
+            // 若顶级节点不存在，自动创建（或根据需求调整为抛异常）
+            topKey = new RegistryKey(topLevelName);
+            registry.getTopLevelKeys().put(topLevelName, topKey);
+        }
+
+        // 递归创建/查找子项
+        RegistryKey current = topKey;
+        for (int i = 1; i < pathParts.length; i++) {
+            String part = pathParts[i];
+            RegistryKey child = current.getSubKeys().get(part);
+            if (child == null) {
+                child = new RegistryKey(part);
+                current.getSubKeys().put(part, child);
+            }
+            current = child;
+        }
+        return current;
+    }
+
+    /**
+     * 解析 .reg 文件中的值内容，自动识别类型
+     * @return  RegistryValue 或 null（无效格式）
+     */
+    private RegistryValue parseRegistryValue(String valueStr) {
+        // 处理空值
+        if (valueStr.equals("\"\"")) {
+            return new RegistryValue("", "String", "");
+        }
+        // 处理带引号的字符串（如 "Hello\\World"）
+        if (valueStr.startsWith("\"") && valueStr.endsWith("\"")) {
+            String value = valueStr.substring(1, valueStr.length() - 1)
+                    .replace("\\\\", "\\")  // 恢复转义反斜杠
+                    .replace("\\n", "\n")   // 恢复换行符
+                    .replace("\\r", "\r");  // 恢复回车符
+            return new RegistryValue("", "String", value);
+        }
+        // 处理 DWord（如 dword:00000001）
+        if (valueStr.toLowerCase().startsWith("dword:")) {
+            String hex = valueStr.substring(6);
+            return new RegistryValue("", "DWord", hex);
+        }
+        // 处理 QWord（如 hex(7):00,00,00,00,00,00,00,01）
+        if (valueStr.toLowerCase().startsWith("hex(7):")) {
+            String hex = valueStr.substring(6).replace(",", "");
+            return new RegistryValue("", "QWord", hex);
+        }
+        // 处理 Binary（如 hex:00,01,02）
+        if (valueStr.toLowerCase().startsWith("hex:")) {
+            String hex = valueStr.substring(4).replace(",", "");
+            return new RegistryValue("", "Binary", hex);
+        }
+        // 处理 Multi-String（如 "Value1\0Value2\0" 或 hex(7):00,01...）
+        // （简化处理：这里默认按 String 类型，实际可扩展自动识别）
+        return new RegistryValue("", "String", valueStr.replace("\"", ""));
+    }
+
+    // 自定义异常：导入失败时抛出
+    private static class RegistryImportException extends Exception {
+        public RegistryImportException(String message) {
+            super(message);
+        }
+    }
+
+    //----------------------------------导入注册表代码----------------------------------------------
+
+    //----------------------------------注册表展示部分的代码----------------------------------------------
 
     /**
      * 从注册表加载数据到树中
@@ -228,17 +622,43 @@ public class RegistryEditor extends JFrame {
         JMenuItem renameItem = new JMenuItem("重命名项");
         renameItem.addActionListener(e -> renameRegistryKey());
 
+        JMenuItem exportItem = new JMenuItem("导出所选项");
+        exportItem.addActionListener(e -> exportRegistry(false));
+
         JMenuItem deleteItem = new JMenuItem("删除");
         deleteItem.addActionListener(e -> deleteSelectedItem());
 
         menu.add(newKeyItem);
         menu.add(newValueItem);
         menu.add(renameItem);
+        menu.add(exportItem);
         menu.addSeparator();
         menu.add(deleteItem);
 
         menu.show(registryTree, x, y);
     }
+
+    /**
+     * 显示表格的右键菜单（新增“重命名键值”）
+     */
+    private void showTableContextMenu(int x, int y, int row) {
+        JPopupMenu menu = new JPopupMenu();
+
+        JMenuItem renameValueItem = new JMenuItem("重命名键值");
+        renameValueItem.addActionListener(e -> renameKeyValue(row));
+
+        JMenuItem deleteValueItem = new JMenuItem("删除键值");
+        deleteValueItem.addActionListener(e -> deleteSelectedValue(row));
+
+        menu.add(renameValueItem);
+        menu.add(deleteValueItem);
+
+        menu.show(valuesTable, x, y);
+    }
+
+    //----------------------------------注册表展示部分的代码----------------------------------------------
+
+    //----------------------------------重命名部分的代码----------------------------------------------
 
     /**
      * 重命名注册表项（核心逻辑）
@@ -308,23 +728,7 @@ public class RegistryEditor extends JFrame {
         return parentObj instanceof RegistryKey ? (RegistryKey) parentObj : null;
     }
 
-    /**
-     * 显示表格的右键菜单（新增“重命名键值”）
-     */
-    private void showTableContextMenu(int x, int y, int row) {
-        JPopupMenu menu = new JPopupMenu();
 
-        JMenuItem renameValueItem = new JMenuItem("重命名键值");
-        renameValueItem.addActionListener(e -> renameKeyValue(row));
-
-        JMenuItem deleteValueItem = new JMenuItem("删除键值");
-        deleteValueItem.addActionListener(e -> deleteSelectedValue(row));
-
-        menu.add(renameValueItem);
-        menu.add(deleteValueItem);
-
-        menu.show(valuesTable, x, y);
-    }
 
     /**
      * 重命名键值名称（核心逻辑）
@@ -383,32 +787,9 @@ public class RegistryEditor extends JFrame {
         saveRegistry();
     }
 
-    /**
-     * 删除选中的键值（原逻辑优化，支持表格右键删除）
-     */
-    private void deleteSelectedValue(int row) {
-        TreePath selectionPath = registryTree.getSelectionPath();
-        if (selectionPath == null) {
-            JOptionPane.showMessageDialog(this, "请先选择注册表项");
-            return;
-        }
+    //----------------------------------重命名部分的代码----------------------------------------------
 
-        DefaultMutableTreeNode selectedNode =
-                (DefaultMutableTreeNode) selectionPath.getLastPathComponent();
-
-        if (!(selectedNode.getUserObject() instanceof RegistryKey)) {
-            JOptionPane.showMessageDialog(this, "请选择有效的注册表项");
-            return;
-        }
-
-        RegistryKey selectedKey = (RegistryKey) selectedNode.getUserObject();
-        String valueName = (String) valuesTableModel.getValueAt(row, 0);
-
-        // 删除键值
-        selectedKey.removeValue(valueName);
-        updateValuesTable(selectedKey);
-        saveRegistry();
-    }
+    //----------------------------------增添注册表项的代码----------------------------------------------
 
     /**
      * 创建新的注册表项
@@ -515,6 +896,7 @@ public class RegistryEditor extends JFrame {
         // 保存注册表
         saveRegistry();
     }
+    //----------------------------------增添注册表项的代码----------------------------------------------
 
     /**
      * 编辑选中的键值对
@@ -555,8 +937,9 @@ public class RegistryEditor extends JFrame {
         }
     }
 
+    //----------------------------------删除部分的代码----------------------------------------------
     /**
-     * 删除选中的项或值
+     * 删除选中的项
      */
     private void deleteSelectedItem() {
         // 检查是否有选中的树节点
@@ -577,7 +960,7 @@ public class RegistryEditor extends JFrame {
 
             if (confirm == JOptionPane.YES_OPTION) {
                 RegistryKey keyToDelete = (RegistryKey) selectedNode.getUserObject();
-                String keyPath = getKeyPath(selectedNode);
+                String keyPath = getKeyPathFromNode(selectedNode);
 
                 // 从注册表中删除
                 registry.deleteKey(keyPath);
@@ -593,11 +976,38 @@ public class RegistryEditor extends JFrame {
             }
         }
     }
+    /**
+     * 删除选中的键值（原逻辑优化，支持表格右键删除）
+     */
+    private void deleteSelectedValue(int row) {
+        TreePath selectionPath = registryTree.getSelectionPath();
+        if (selectionPath == null) {
+            JOptionPane.showMessageDialog(this, "请先选择注册表项");
+            return;
+        }
+
+        DefaultMutableTreeNode selectedNode =
+                (DefaultMutableTreeNode) selectionPath.getLastPathComponent();
+
+        if (!(selectedNode.getUserObject() instanceof RegistryKey)) {
+            JOptionPane.showMessageDialog(this, "请选择有效的注册表项");
+            return;
+        }
+
+        RegistryKey selectedKey = (RegistryKey) selectedNode.getUserObject();
+        String valueName = (String) valuesTableModel.getValueAt(row, 0);
+
+        // 删除键值
+        selectedKey.removeValue(valueName);
+        updateValuesTable(selectedKey);
+        saveRegistry();
+    }
+    //----------------------------------删除部分的代码----------------------------------------------
 
     /**
      * 获取注册表项的完整路径
      */
-    private String getKeyPath(DefaultMutableTreeNode node) {
+    private String getKeyPathFromNode(DefaultMutableTreeNode node) {
         StringBuilder path = new StringBuilder();
         TreePath treePath = new TreePath(node.getPath());
         Object[] pathComponents = treePath.getPath();
@@ -731,4 +1141,5 @@ public class RegistryEditor extends JFrame {
             new RegistryEditor().setVisible(true);
         });
     }
+
 }
